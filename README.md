@@ -92,6 +92,23 @@ That makes it immune to the usual kubeconfig traps, and `doctor` reports each on
 
 \* sensitive · † write
 
+**Partial results.** Tools that can return part of a set say so. Check `truncated` before
+treating a missing item as absent.
+
+- `list_k8s_resources`: at most 500 per call. On `truncated: true`, call again with
+  `continue_token`, repeating kind, namespace and selectors, until it is `null`. `remaining` is
+  the API server's approximate count still to come. An expired token is an error: restart from the
+  first page and discard what you fetched.
+- `get_k8s_events`: newest first. `total` counts matches before `limit`, and `truncated` is
+  `total > limit`. `since_minutes` filters by time.
+- `get_cloudwatch_logs`: oldest first within a fixed `window`. On `truncated: true`, call again
+  with `next_token`, `start_ms` and `end_ms`. An empty page with `truncated: true` does not
+  mean there are no matches.
+- `fleet_list_k8s_resources`: `count` is the full count per cluster. `names` is capped at
+  `names_limit`, and `truncated` says when it was.
+
+Every other tool pages to completion and returns the whole set.
+
 **Targets** can be an alias, any kube context name, a cluster ARN, or
 `<account-id | account-name | profile | env>/<cluster>` (needed when two accounts share a
 cluster name). **Selectors** for fleet tools and `list_targets` are comma-separated terms:
@@ -189,6 +206,16 @@ uv run python scripts/check_identifiers.py --all
 
 The offline suite replaces boto3 and the Kubernetes client with in-memory doubles
 (`tests/fakes.py`) and hides `$HOME`, `~/.aws` and `$KUBECONFIG`, so it runs anywhere.
+
+`tests/test_kind.py` checks paging and truncation against a real API server on a throwaway
+local kind cluster (Docker and kind required; no AWS). Its etcd compacts every 10 s so
+continue tokens really expire.
+
+```bash
+eval "$(scripts/kind-paging-cluster.sh up | tail -1)"
+uv run --group dev pytest -m kind -v --durations=0
+scripts/kind-paging-cluster.sh down
+```
 
 `tests/test_live.py` is an opt-in end-to-end run against real clusters with your own
 config and SSO sessions. Every write in it is a server-side dry run followed by a read

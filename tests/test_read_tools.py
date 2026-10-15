@@ -1,7 +1,7 @@
 """Read tools against in-memory Kubernetes and AWS doubles."""
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import kubernetes.client
@@ -12,6 +12,7 @@ from fakes import (
     FakeAws,
     FakeDynamic,
     FakeResource,
+    api_error,
     install_aws,
     install_dynamic,
     make_server,
@@ -19,6 +20,7 @@ from fakes import (
     tool_error,
 )
 from kubernetes.client.exceptions import ApiException
+from kubernetes.dynamic.exceptions import BadRequestError
 
 from eks_multi_mcp.auth import CredentialError
 
@@ -163,6 +165,75 @@ def test_credential_errors_become_tool_errors(files, monkeypatch):
     assert "SSO session" in tool_error(srv, "list_k8s_resources", target="dev", kind="Pod")
 
 
+# ------------------------------------------------------------------ list paging
+def _paged(monkeypatch, srv, n=1200, **kw):
+    res = FakeResource("Pod", items=[pod(f"p{i:04d}", f"ns{i % 3}") for i in range(n)], paged=True, **kw)
+    install_dynamic(monkeypatch, srv, FakeDynamic(res))
+    return res
+
+
+def test_list_k1_pages_to_completion(files, monkeypatch):
+    srv = make_server(files)
+    res = _paged(monkeypatch, srv)
+    pages, token = [], None
+    for _ in range(10):
+        out = result(srv, "list_k8s_resources", target="dev", kind="Pod", label_selector="app=x", limit=500,
+                     **({"continue_token": token} if token else {}))
+        pages.append(out)
+        token = out["continue_token"]
+        if not out["truncated"]:
+            break
+    assert [len(p["result"]) for p in pages] == [p["count"] for p in pages] == [500, 500, 200]
+    assert all(isinstance(p["continue_token"], str) and p["continue_token"] for p in pages[:-1])
+    assert pages[-1]["continue_token"] is None
+    keys = [(r["namespace"], r["name"]) for p in pages for r in p["result"]]
+    assert len(keys) == len(set(keys)) == 1200
+    assert set(keys) == {(i["metadata"]["namespace"], i["metadata"]["name"]) for i in res.items}
+    sent = [kw for _, kw in res.calls]
+    assert [kw.get("_continue") for kw in sent] == [None, pages[0]["continue_token"], pages[1]["continue_token"]]
+    assert all(kw["namespace"] is None and kw["label_selector"] == "app=x" for kw in sent)
+
+
+@pytest.mark.parametrize("asked,sent", [(0, 1), (-5, 1), (10_000, 500), (200, 200)])
+def test_list_k5_clamps_limit(k8s, asked, sent):
+    result(k8s.srv, "list_k8s_resources", target="dev", kind="Pod", limit=asked)
+    assert k8s.pods.calls[-1][1]["limit"] == sent
+
+
+def test_list_k6_expired_token_says_restart(files, monkeypatch):
+    srv = make_server(files)
+    _paged(monkeypatch, srv).gone_tokens.add("stale")
+    msg = tool_error(srv, "list_k8s_resources", target="dev", kind="Pod", continue_token="stale")
+    assert "expired" in msg and "restart the listing without continue_token" in msg
+
+
+def test_list_k7_rejected_token_passes_the_api_message(files, monkeypatch):
+    srv = make_server(files)
+    _paged(monkeypatch, srv).bad_tokens.add("junk")
+    msg = tool_error(srv, "list_k8s_resources", target="dev", kind="Pod", continue_token="junk")
+    assert "continue_token was rejected" in msg and "invalid continue token" in msg
+
+
+def test_list_k8_bad_request_without_token_stays_generic(files, monkeypatch):
+    srv = make_server(files)
+    res = _paged(monkeypatch, srv)
+
+    def bad(**kw):
+        raise api_error(BadRequestError, 400, "Bad Request", "unable to parse requirement")
+
+    monkeypatch.setattr(res, "get", bad)
+    msg = tool_error(srv, "list_k8s_resources", target="dev", kind="Pod")
+    assert msg.startswith("Kubernetes API 400") and "continue_token" not in msg
+
+
+@pytest.mark.parametrize("report,want", [(True, 1100), (False, None)])
+def test_list_k10_reports_remaining(files, monkeypatch, report, want):
+    srv = make_server(files)
+    _paged(monkeypatch, srv, report_remaining=report)
+    out = result(srv, "list_k8s_resources", target="dev", kind="Pod", limit=100)
+    assert out["remaining"] == want
+
+
 # ------------------------------------------------------------------ CoreV1-based reads
 class FakeCore:
     def __init__(self, events=()):
@@ -218,6 +289,57 @@ def test_events_all_namespaces_without_filters(files, monkeypatch, core):
     out = result(srv, "get_k8s_events", target="dev")
     assert core.calls == [("all", None, {})]
     assert out["result"][-1]["time"] is None  # undated events sort last
+
+
+def _events(n):
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    return [ev(f"e{i}", start + timedelta(minutes=i)) for i in range(n)]
+
+
+def _core_with(monkeypatch, srv, events):
+    fc = FakeCore(events)
+    monkeypatch.setattr(kubernetes.client, "CoreV1Api", lambda api: fc)
+    _no_client(srv, monkeypatch)
+    return fc
+
+
+def test_events_e1_report_total_and_truncation(files, monkeypatch):
+    srv = make_server(files)
+    _core_with(monkeypatch, srv, _events(150))
+    out = result(srv, "get_k8s_events", target="dev", limit=100)
+    assert (len(out["result"]), out["count"], out["total"], out["truncated"]) == (100, 100, 150, True)
+    assert (out["result"][0]["object"], out["result"][-1]["object"]) == ("Pod/e149", "Pod/e50")
+
+
+@pytest.mark.parametrize("n,limit,rows,truncated", [
+    (40, None, 40, False),      # E2
+    (100, 100, 100, False),     # E3 boundary
+    (600, 10_000, 500, True),   # E4 clamp high
+    (3, 0, 1, True),            # E4 clamp low
+])
+def test_events_e2_e3_e4_totals_and_clamps(files, monkeypatch, n, limit, rows, truncated):
+    srv = make_server(files)
+    _core_with(monkeypatch, srv, _events(n))
+    out = result(srv, "get_k8s_events", target="dev", **({"limit": limit} if limit is not None else {}))
+    assert (len(out["result"]), out["total"], out["truncated"]) == (rows, n, truncated)
+
+
+def test_events_e5_e6_since_minutes_filters_locally(files, monkeypatch):
+    srv = make_server(files)
+    now = datetime.now(UTC)
+    fc = _core_with(monkeypatch, srv, [ev("recent", now - timedelta(minutes=30)),
+                                       ev("old", now - timedelta(minutes=90)), ev("undated", None)])
+    out = result(srv, "get_k8s_events", target="dev", since_minutes=60)
+    assert [r["object"] for r in out["result"]] == ["Pod/recent"] and out["total"] == 1
+    assert fc.calls == [("all", None, {})]
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_events_e8_rejects_nonpositive_since_minutes(files, monkeypatch, bad):
+    srv = make_server(files)
+    fc = _core_with(monkeypatch, srv, _events(3))
+    assert "since_minutes must be at least 1" in tool_error(srv, "get_k8s_events", target="dev", since_minutes=bad)
+    assert fc.calls == []
 
 
 def test_pod_logs(files, monkeypatch, core):
@@ -302,6 +424,84 @@ def test_cloudwatch_logs_gated(files):
     assert "sensitive data access" in tool_error(make_server(files), "get_cloudwatch_logs", target="dev")
 
 
+def log_pages(*pages):
+    """filter_log_events serving (n_events, next_token) pages in order, honoring the sent limit."""
+    it = iter(pages)
+
+    def serve(**kw):
+        n, token = next(it)
+        events = [{"timestamp": i, "logStreamName": "s", "message": f"m{i}"} for i in range(min(n, kw["limit"]))]
+        return {"events": events, **({"nextToken": token} if token else {})}
+    return serve
+
+
+def _logs(files, monkeypatch, serve):
+    srv = make_server(files, safety={"allow_sensitive_data_access": True})
+    logs = FakeAws(filter_log_events=serve)
+    install_aws(monkeypatch, srv, logs=logs)
+    return srv, logs
+
+
+def test_cloudwatch_logs_l1_follows_tokens_past_empty_pages(files, monkeypatch):
+    srv, logs = _logs(files, monkeypatch, log_pages((0, "a"), (0, "b"), (3, None)))
+    out = result(srv, "get_cloudwatch_logs", target="dev")
+    assert (out["count"], len(out["result"]), out["truncated"], out["next_token"]) == (3, 3, False, None)
+    assert [kw.get("nextToken") for _, kw in logs.calls] == [None, "a", "b"]
+
+
+def test_cloudwatch_logs_l2_stops_at_limit_and_returns_the_token(files, monkeypatch):
+    srv, logs = _logs(files, monkeypatch, log_pages((60, "a"), (60, "b")))
+    out = result(srv, "get_cloudwatch_logs", target="dev", limit=100)
+    assert [kw["limit"] for _, kw in logs.calls] == [100, 40]
+    assert (out["count"], out["truncated"], out["next_token"]) == (100, True, "b")
+
+
+def test_cloudwatch_logs_l3_limit_reached_on_the_last_page(files, monkeypatch):
+    srv, _ = _logs(files, monkeypatch, log_pages((60, "a"), (60, None)))
+    out = result(srv, "get_cloudwatch_logs", target="dev", limit=100)
+    assert (out["count"], out["truncated"], out["next_token"]) == (100, False, None)
+
+
+def test_cloudwatch_logs_l4_page_budget(files, monkeypatch):
+    from eks_multi_mcp.server import MAX_LOG_PAGES
+
+    srv, logs = _logs(files, monkeypatch, lambda **kw: {"events": [], "nextToken": "t"})
+    out = result(srv, "get_cloudwatch_logs", target="dev")
+    assert len(logs.calls) == MAX_LOG_PAGES
+    assert (out["result"], out["truncated"], out["next_token"]) == ([], True, "t")
+
+
+def test_cloudwatch_logs_l5_fixed_window(files, monkeypatch):
+    srv, logs = _logs(files, monkeypatch, log_pages((1, "a"), (1, None)))
+    out = result(srv, "get_cloudwatch_logs", target="dev", minutes=30)
+    windows = {(kw["startTime"], kw["endTime"]) for _, kw in logs.calls}
+    assert len(windows) == 1
+    (start, end), = windows
+    assert out["window"] == {"start_ms": start, "end_ms": end} and end - start == 30 * 60 * 1000
+
+
+def test_cloudwatch_logs_l6_resumes_in_the_given_window(files, monkeypatch):
+    srv, logs = _logs(files, monkeypatch, log_pages((2, None)))
+    out = result(srv, "get_cloudwatch_logs", target="dev", next_token="t", start_ms=1000, end_ms=2000)
+    (_, kw), = logs.calls
+    assert (kw["nextToken"], kw["startTime"], kw["endTime"]) == ("t", 1000, 2000)
+    assert out["window"] == {"start_ms": 1000, "end_ms": 2000}
+
+
+@pytest.mark.parametrize("args", [{"next_token": "t"}, {"next_token": "t", "start_ms": 1}, {"start_ms": 1}])
+def test_cloudwatch_logs_l7_resume_needs_the_window(files, monkeypatch, args):
+    srv, logs = _logs(files, monkeypatch, log_pages((1, None)))
+    msg = tool_error(srv, "get_cloudwatch_logs", target="dev", **args)
+    assert "start_ms" in msg and "end_ms" in msg
+    assert logs.calls == []
+
+
+def test_cloudwatch_logs_l8_clamps_limit_low(files, monkeypatch):
+    srv, logs = _logs(files, monkeypatch, log_pages((5, None)))
+    result(srv, "get_cloudwatch_logs", target="dev", limit=0)
+    assert logs.calls[0][1]["limit"] == 1
+
+
 def test_cloudwatch_metrics_adds_cluster_dimension(files, monkeypatch):
     srv = make_server(files)
     t2, t1 = datetime(2026, 1, 2, tzinfo=UTC), datetime(2026, 1, 1, tzinfo=UTC)
@@ -372,12 +572,32 @@ def test_fleet_overview_isolates_failures(files, monkeypatch):
 def test_fleet_overview_with_insight_counts(files, monkeypatch):
     srv = make_server(files)
     monkeypatch.setattr(srv.auth, "describe_cluster", lambda t, refresh=False: {"version": "1.31"})
-    install_aws(monkeypatch, srv, eks=FakeAws(list_insights={"insights": [
+    install_aws(monkeypatch, srv, eks=FakeAws(paginators={"list_insights": [{"insights": [
         {"insightStatus": {"status": "ERROR"}}, {"insightStatus": {"status": "PASSING"}},
-        {"insightStatus": {"status": "PASSING"}}]}))
+        {"insightStatus": {"status": "PASSING"}}]}]}))
     out = result(srv, "fleet_overview", selector="env:dev", include_insights=True)
     assert out["clusters"] and all(c["upgradeInsights"] == {"ERROR": 1, "WARNING": 0, "PASSING": 2, "UNKNOWN": 0}
                                    for c in out["clusters"])
+
+
+def test_fleet_overview_i1_sums_insights_across_pages(files, monkeypatch):
+    srv = make_server(files)
+    monkeypatch.setattr(srv.auth, "describe_cluster", lambda t, refresh=False: {"version": "1.31"})
+    eks = FakeAws(paginators={"list_insights": [
+        {"insights": [{"insightStatus": {"status": "ERROR"}}, {"insightStatus": {"status": "PASSING"}}]},
+        {"insights": [{"insightStatus": {"status": "PASSING"}}, {"insightStatus": {"status": "WARNING"}}]}]})
+    install_aws(monkeypatch, srv, eks=eks)
+    out = result(srv, "fleet_overview", selector="env:dev", include_insights=True)
+    assert out["clusters"] and all(c["upgradeInsights"] == {"ERROR": 1, "WARNING": 1, "PASSING": 2, "UNKNOWN": 0}
+                                   for c in out["clusters"])
+    assert eks.paginators["list_insights"].kwargs["filter"] == {"categories": ["UPGRADE_READINESS"]}
+
+
+def test_c2_paged_tools_stay_read_only(files):
+    import asyncio
+    tools = {t.name: t for t in asyncio.run(make_server(files).mcp.list_tools())}
+    for name in ("list_k8s_resources", "get_k8s_events", "get_cloudwatch_logs", "fleet_overview"):
+        assert tools[name].annotations.read_only_hint is True
 
 
 def test_fleet_list_k8s_resources(files, monkeypatch):

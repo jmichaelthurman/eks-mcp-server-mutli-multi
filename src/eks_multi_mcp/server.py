@@ -17,7 +17,7 @@ import anyio
 import yaml
 from botocore.exceptions import BotoCoreError, ClientError
 from kubernetes.client.exceptions import ApiException
-from kubernetes.dynamic.exceptions import DynamicApiError, ResourceNotFoundError
+from kubernetes.dynamic.exceptions import BadRequestError, DynamicApiError, GoneError, ResourceNotFoundError
 from mcp.server.elicitation import render_elicitation_schema
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -60,6 +60,7 @@ Multi-account, multi-cluster Amazon EKS server.
 """
 
 MAX_ITEMS = 500
+MAX_LOG_PAGES = 20  # FilterLogEvents can return empty pages mid-scan; bounds one call's work
 SENSITIVE_KINDS = {"Secret"}
 PROMPT_DETAIL_CHARS = 6000  # larger writes are refused, never shown in part
 # Request YAML sits between these markers with every line indented, so nothing in it can
@@ -451,22 +452,43 @@ class EksMultiServer:
         def get_cloudwatch_logs(target: str, log_type: Literal["application", "host", "dataplane", "performance",
                                                                "control-plane"] = "application",
                                 filter_pattern: str = "", minutes: int = 30, limit: int = 100,
-                                log_group: str | None = None) -> dict:
-            """Search CloudWatch logs for a cluster (Container Insights groups, or the control plane).
-            Requires sensitive data access."""
+                                log_group: str | None = None, next_token: str | None = None,
+                                start_ms: int | None = None, end_ms: int | None = None) -> dict:
+            """Search CloudWatch logs for a cluster (Container Insights groups, or the control plane),
+            oldest first within the window. Requires sensitive data access.
+
+            Returns at most limit (<= 1000) events. truncated=true means more events exist in the
+            window: call again with next_token plus the returned window's start_ms and end_ms
+            (and the same log group and filter_pattern). An empty result with truncated=true does
+            not mean there are no matches.
+            """
             self.require_sensitive("reading CloudWatch logs")
+            if (start_ms is None) != (end_ms is None) or (next_token and start_ms is None):
+                raise ToolError("next_token needs start_ms and end_ms from the window of the call that "
+                                "returned it, and start_ms and end_ms must be given together")
             t = self.target(target)
             group = log_group or (f"/aws/eks/{t.cluster_name}/cluster" if log_type == "control-plane"
                                   else f"/aws/containerinsights/{t.cluster_name}/{log_type}")
             logs = self.auth.aws(t, "logs")
-            start = int((time.time() - minutes * 60) * 1000)
-            kw: dict[str, Any] = {"logGroupName": group, "startTime": start, "limit": min(limit, 1000)}
+            if start_ms is None:
+                end_ms = int(time.time() * 1000)
+                start_ms = end_ms - minutes * 60 * 1000
+            want = _clamp(limit, 1000)
+            kw: dict[str, Any] = {"logGroupName": group, "startTime": start_ms, "endTime": end_ms}
             if filter_pattern:
                 kw["filterPattern"] = filter_pattern
-            events = logs.filter_log_events(**kw).get("events", [])
+            events: list[dict] = []
+            token = next_token
+            for _ in range(MAX_LOG_PAGES):
+                page = logs.filter_log_events(**kw, limit=want - len(events), **({"nextToken": token} if token else {}))
+                events += page.get("events", [])
+                token = page.get("nextToken")
+                if not token or len(events) >= want:
+                    break
             rows = [{"ts": datetime.fromtimestamp(e["timestamp"] / 1000, UTC).isoformat(),
                      "stream": e.get("logStreamName"), "message": e.get("message")} for e in events]
-            return self.wrap(t, rows, log_group=group)
+            return self.wrap(t, rows, log_group=group, count=len(rows), truncated=bool(token),
+                             next_token=token, window={"start_ms": start_ms, "end_ms": end_ms})
 
         @tool
         def get_cloudwatch_metrics(target: str, metric_name: str, namespace: str = "ContainerInsights",
@@ -520,19 +542,37 @@ class EksMultiServer:
         @tool
         def list_k8s_resources(target: str, kind: str, api_version: str = "v1", namespace: str | None = None,
                                label_selector: str | None = None, field_selector: str | None = None,
-                               limit: int = 200) -> dict:
+                               limit: int = 200, continue_token: str | None = None) -> dict:
             """List Kubernetes resources of one kind (summaries: name, namespace, age, status).
 
-            namespace=None lists across all namespaces for namespaced kinds.
+            namespace=None lists across all namespaces for namespaced kinds. At most 500 items per
+            call. truncated=true means the result is incomplete: call again with the returned
+            continue_token, repeating kind, namespace and selectors unchanged, until it is null.
+            remaining is the API server's approximate count still to come (null with selectors).
             """
             t = self.target(target)
             res = self._resource(t, api_version, kind)
             kw = _selectors(label_selector, field_selector)
-            kw["limit"] = min(limit, MAX_ITEMS)
-            objs = res.get(namespace=namespace, **kw) if res.namespaced else res.get(**kw)
-            items = [_summarize(o) for o in objs.to_dict().get("items", [])]
-            more = bool((objs.to_dict().get("metadata") or {}).get("continue"))
-            return self.wrap(t, items, count=len(items), truncated=more)
+            kw["limit"] = _clamp(limit)
+            if continue_token:
+                kw["_continue"] = continue_token
+            try:
+                objs = (res.get(namespace=namespace, **kw) if res.namespaced else res.get(**kw)).to_dict()
+            except GoneError as e:
+                if not continue_token:
+                    raise
+                raise ToolError("continue_token has expired (410 Gone); restart the listing without "
+                                "continue_token and discard the pages already fetched") from e
+            except BadRequestError as e:
+                if not continue_token:
+                    raise
+                raise ToolError(f"continue_token was rejected: {_k8s_error(e)}; "
+                                "restart the listing without continue_token") from e
+            items = [_summarize(o) for o in objs.get("items", [])]
+            md = objs.get("metadata") or {}
+            nxt = md.get("continue") or None
+            return self.wrap(t, items, count=len(items), truncated=bool(nxt), continue_token=nxt,
+                             remaining=md.get("remainingItemCount"))
 
         @tool
         def get_k8s_resource(target: str, kind: str, name: str, api_version: str = "v1",
@@ -552,8 +592,16 @@ class EksMultiServer:
         @tool
         def get_k8s_events(target: str, namespace: str | None = None, involved_kind: str | None = None,
                            involved_name: str | None = None, warnings_only: bool = False,
-                           limit: int = 100) -> dict:
-            """Recent Kubernetes events, newest first, optionally scoped to one object."""
+                           limit: int = 100, since_minutes: int | None = None) -> dict:
+            """Recent Kubernetes events, newest first, optionally scoped to one object.
+
+            total is the number of matching events before limit (at most 500) is applied;
+            truncated=true means older matches were left out. since_minutes keeps only events
+            seen within that many minutes. It is applied here after the full list is fetched,
+            and drops undated events.
+            """
+            if since_minutes is not None and since_minutes < 1:
+                raise ToolError("since_minutes must be at least 1")
             t = self.target(target)
             from kubernetes import client as kc
             core = kc.CoreV1Api(self.auth.api_client(t))
@@ -571,12 +619,16 @@ class EksMultiServer:
             def when(e):
                 return e.last_timestamp or e.event_time or e.first_timestamp or e.metadata.creation_timestamp
 
+            if since_minutes is not None:
+                cutoff = datetime.now(UTC) - timedelta(minutes=since_minutes)
+                ev = [e for e in ev if (w := when(e)) is not None and w >= cutoff]
             ev.sort(key=lambda e: when(e) or datetime.min.replace(tzinfo=UTC), reverse=True)
+            n = _clamp(limit)
             rows = [{"time": (when(e).isoformat() if when(e) else None), "type": e.type, "reason": e.reason,
                      "object": f"{e.involved_object.kind}/{e.involved_object.name}",
                      "namespace": e.metadata.namespace, "count": e.count, "message": e.message}
-                    for e in ev[:limit]]
-            return self.wrap(t, rows, count=len(rows))
+                    for e in ev[:n]]
+            return self.wrap(t, rows, count=len(rows), total=len(ev), truncated=len(ev) > n)
 
         @tool
         def get_pod_logs(target: str, namespace: str, pod_name: str, container: str | None = None,
@@ -693,8 +745,9 @@ class EksMultiServer:
                        "createdAt": c.get("createdAt").isoformat() if c.get("createdAt") else None}
                 if include_insights:
                     eks = self.auth.aws(t, "eks")
-                    ins = eks.list_insights(clusterName=t.cluster_name,
-                                            filter={"categories": ["UPGRADE_READINESS"]})["insights"]
+                    ins = [i for page in eks.get_paginator("list_insights").paginate(
+                               clusterName=t.cluster_name, filter={"categories": ["UPGRADE_READINESS"]})
+                           for i in page["insights"]]
                     row["upgradeInsights"] = {s: sum(1 for i in ins if i.get("insightStatus", {}).get("status") == s)
                                               for s in ("ERROR", "WARNING", "PASSING", "UNKNOWN")}
                 return row
@@ -850,6 +903,11 @@ def _namespace(res, namespace: str | None, what: str) -> str | None:
     if not namespace:
         raise ToolError(f"{what} is namespaced; pass a namespace")
     return namespace
+
+
+def _clamp(n: int, hi: int = MAX_ITEMS) -> int:
+    """A page size the server will honor: 0 means "no limit" to the API server, so never send it."""
+    return max(1, min(n, hi))
 
 
 def _selectors(label_selector: str | None, field_selector: str | None) -> dict:

@@ -34,7 +34,10 @@ target-version = "py311"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["live: talks to real clusters; runs only when EKS_MULTI_MCP_LIVE_TARGET is set"]
+markers = [
+    "live: talks to real clusters; runs only when EKS_MULTI_MCP_LIVE_TARGET is set",
+    "kind: talks to a local kind cluster; runs only when EKS_MULTI_MCP_KIND_KUBECONFIG is set",
+]
 
 [project.urls]
 Repository = "https://github.com/jmichaelthurman/eks-multi-mcp"
