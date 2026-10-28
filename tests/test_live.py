@@ -187,3 +187,46 @@ def test_unknown_target_lists_suggestions(srv):
 def test_list_targets_includes_target(srv):
     res = call(srv, "list_targets")
     assert srv.registry.resolve(TARGET).alias in res.content[0].text
+
+
+# ------------------------------------------------------------------ paging and truncation (read-only)
+@pytest.fixture(scope="module")
+def ro(srv):
+    """A read-only server; depends on srv only so the non-prod check above runs first."""
+    return _server()
+
+
+def test_lv1_paged_pods_match_the_unpaged_fleet_listing(ro):
+    paged, token = [], None
+    for _ in range(1000):
+        out = result(ro, "list_k8s_resources", target=TARGET, kind="Pod", limit=50,
+                     **({"continue_token": token} if token else {}))
+        paged += [f"{r['namespace']}/{r['name']}" for r in out["result"]]
+        token = out["continue_token"]
+        if not out["truncated"]:
+            break
+    assert not token, "paging never finished"
+    assert len(paged) == len(set(paged)), "duplicate pods across pages"
+    alias = ro.registry.resolve(TARGET).alias
+    fleet = result(ro, "fleet_list_k8s_resources", kind="Pod", selector=alias, names_limit=100_000)
+    (cluster,) = fleet["clusters"]
+    unpaged = set(cluster["names"])
+    diff = set(paged) ^ unpaged
+    print(f"\nLV1: {len(paged)} paged, {len(unpaged)} unpaged, {len(diff)} differ (pod churn)")
+    assert len(diff) <= max(1, 0.02 * len(unpaged))
+
+
+def test_lv2_junk_continue_token_is_rejected(ro):
+    msg = tool_error(ro, "list_k8s_resources", target=TARGET, kind="Pod", continue_token="garbage")
+    assert "continue_token was rejected" in msg and "invalid continue token" in msg
+
+
+def test_lv3_cloudwatch_logs_report_window_and_resume():
+    logs = _server(allow_sensitive_data_access=True)
+    out = result(logs, "get_cloudwatch_logs", target=TARGET, log_type="control-plane", minutes=5, limit=5)
+    assert {"window", "truncated", "next_token", "count"} <= set(out)
+    print(f"\nLV3: {out['count']} events, truncated={out['truncated']}")  # never the messages
+    if out["truncated"]:
+        nxt = result(logs, "get_cloudwatch_logs", target=TARGET, log_type="control-plane", limit=5,
+                     next_token=out["next_token"], **out["window"])
+        assert nxt["window"] == out["window"] and nxt["count"] >= 0

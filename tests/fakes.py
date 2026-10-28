@@ -12,7 +12,8 @@ import json
 import re
 from types import SimpleNamespace
 
-from kubernetes.dynamic.exceptions import ResourceNotFoundError
+from kubernetes.client.exceptions import ApiException
+from kubernetes.dynamic.exceptions import BadRequestError, GoneError, ResourceNotFoundError
 
 from eks_multi_mcp.config import settings_from_dict
 from eks_multi_mcp.server import EksMultiServer
@@ -90,9 +91,19 @@ class Obj:
         return copy.deepcopy(self._d)
 
 
+def api_error(cls, status: int, reason: str, message: str):
+    """A dynamic-client error as the API server would raise it, with a JSON Status body."""
+    e = ApiException(status=status, reason=reason)
+    e.body = json.dumps({"message": message})
+    return cls(e)
+
+
 class FakeResource:
+    """paged=True honors limit and _continue (offset tokens "off:<n>") like a real list;
+    otherwise every item comes back at once with the fixed continue_token."""
+
     def __init__(self, kind: str, namespaced: bool = True, api_version: str = "v1", items=None,
-                 base_kind: str | None = None):
+                 base_kind: str | None = None, paged: bool = False, report_remaining: bool = False):
         self.kind = kind
         self.namespaced = namespaced
         self.api_version = api_version
@@ -100,13 +111,30 @@ class FakeResource:
         self.items: list[dict] = items or []
         self.calls: list[tuple[str, dict]] = []
         self.continue_token: str | None = None
+        self.paged = paged
+        self.report_remaining = report_remaining
+        self.gone_tokens: set[str] = set()
+        self.bad_tokens: set[str] = set()
         self.delete_response: dict | None = None
 
     def get(self, name=None, namespace=None, **kw):
         self.calls.append(("get", {"name": name, "namespace": namespace, **kw}))
         if name is None:
             items = [i for i in self.items if namespace is None or i["metadata"].get("namespace") == namespace]
-            return Obj({"items": items, "metadata": {"continue": self.continue_token}})
+            if not self.paged:
+                return Obj({"items": items, "metadata": {"continue": self.continue_token}})
+            tok = kw.get("_continue")
+            if tok in self.gone_tokens:
+                raise api_error(GoneError, 410, "Gone", "The provided continue parameter is too old")
+            if tok in self.bad_tokens:
+                raise api_error(BadRequestError, 400, "Bad Request", "invalid continue token: continue key is not valid")
+            start = int(tok.removeprefix("off:")) if tok else 0
+            page = items[start:start + (kw.get("limit") or len(items))]
+            end = start + len(page)
+            md: dict = {"continue": f"off:{end}" if end < len(items) else None}
+            if self.report_remaining and end < len(items):
+                md["remainingItemCount"] = len(items) - end
+            return Obj({"items": page, "metadata": md})
         for i in self.items:
             if i["metadata"]["name"] == name and (namespace is None or i["metadata"].get("namespace") == namespace):
                 return Obj(i)
